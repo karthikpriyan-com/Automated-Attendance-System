@@ -1,0 +1,87 @@
+const express = require("express");
+const fs = require("fs");
+
+const app = express();
+app.use(express.json());
+app.use(express.static("public"));
+
+const file = "data.json";
+
+function getData() {
+    if (!fs.existsSync(file))
+        fs.writeFileSync(file, JSON.stringify({students:[], attendance:[]}));
+    return JSON.parse(fs.readFileSync(file));
+}
+
+function saveData(data) {
+    fs.writeFileSync(file, JSON.stringify(data, null, 2));
+}
+
+app.post("/api/login", (req, res) => {
+    if(req.body.username === "admin" &&
+       req.body.password === "admin123") {
+        return res.json({success:true});
+    }
+    res.status(401).json({message:"Invalid login"});
+});
+
+app.get("/api/students", (req,res) => {
+    res.json(getData().students);
+});
+
+app.post("/api/students", (req,res) => {
+    const data = getData();
+    const student = {
+        id: Date.now().toString(),
+        name: req.body.name,
+        rollNo: req.body.rollNo,
+        department: req.body.department,
+        year: req.body.year
+    };
+
+    if(!student.name || !student.rollNo ||
+       !student.department || !student.year)
+        return res.status(400).json({message:"Fill all details"});
+
+    if(data.students.some(s => s.rollNo === student.rollNo))
+        return res.status(409).json({message:"Roll number exists"});
+
+    data.students.push(student);
+    saveData(data);
+    res.json(student);
+});
+
+app.get("/api/attendance", (req,res) => {
+    const data = getData();
+    res.json(data.attendance.filter(a => a.date === req.query.date));
+});
+
+app.post("/api/attendance", (req,res) => {
+    const data = getData();
+    const {date, records} = req.body;
+
+    records.forEach(r => {
+        const student = data.students.find(s => s.id === r.studentId);
+        if(!student) return;
+
+        const old = data.attendance.find(
+            a => a.studentId === r.studentId && a.date === date
+        );
+
+        if(old) old.status = r.status;
+        else data.attendance.push({
+            studentId:r.studentId,
+            name:student.name,
+            rollNo:student.rollNo,
+            date,
+            status:r.status
+        });
+    });
+
+    saveData(data);
+    res.json({message:"Attendance saved successfully"});
+});
+
+app.listen(3000, () => {
+    console.log("Server running at http://localhost:3000");
+});
