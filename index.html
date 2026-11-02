@@ -1,0 +1,321 @@
+"""Automated Attendance System - Flask backend (SRS FR1-FR12, face recognition per UML).
+Run:  pip install -r requirements.txt && python app.py
+Default admin: admin@college.edu / admin123  (change immediately)
+DB: SQLite for zero-setup. For MySQL, swap get_db() for mysql.connector (same SQL).
+"""
+import base64, csv, io, json, sqlite3
+from datetime import date, datetime
+from functools import wraps
+from flask import Flask, g, jsonify, render_template, request, session, Response
+from werkzeug.security import check_password_hash, generate_password_hash
+
+try:
+    import face_recognition, numpy as np
+    from PIL import Image
+    FACE_ENABLED = True
+except ImportError:
+    FACE_ENABLED = False
+
+app = Flask(__name__)
+app.secret_key = "CHANGE-ME-IN-PRODUCTION"
+DB_FILE = "attendance.db"
+FACE_THRESHOLD = 0.5      # lower = stricter (FaceRecognition.threshold)
+MAX_ATTEMPTS = 3          # then faculty does manual entry (state diagram)
+MIN_PERCENT = 75.0        # FR10 low-attendance limit
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+  email TEXT UNIQUE NOT NULL, password TEXT NOT NULL,
+  role TEXT NOT NULL CHECK(role IN ('STUDENT','FACULTY','ADMIN')),
+  roll_no TEXT, department TEXT, year INTEGER, section TEXT);
+CREATE TABLE IF NOT EXISTS subjects(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+  faculty_id INTEGER REFERENCES users(id), department TEXT);
+CREATE TABLE IF NOT EXISTS sessions(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, subject_id INTEGER NOT NULL REFERENCES subjects(id),
+  date TEXT NOT NULL, start_time TEXT NOT NULL, end_time TEXT, room TEXT,
+  active INTEGER DEFAULT 1);
+CREATE TABLE IF NOT EXISTS attendance(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, student_id INTEGER NOT NULL REFERENCES users(id),
+  session_id INTEGER NOT NULL REFERENCES sessions(id),
+  date TEXT, time TEXT, status TEXT DEFAULT 'PRESENT', method TEXT, remarks TEXT,
+  UNIQUE(student_id, session_id));            -- FR6: no duplicate attendance
+CREATE TABLE IF NOT EXISTS face_encodings(
+  student_id INTEGER PRIMARY KEY REFERENCES users(id), encoding TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS notifications(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, message TEXT,
+  created TEXT, is_read INTEGER DEFAULT 0);
+"""
+
+# ---------- DB helpers ----------
+def get_db():
+    if "db" not in g:
+        g.db = sqlite3.connect(DB_FILE)
+        g.db.row_factory = sqlite3.Row
+        g.db.execute("PRAGMA foreign_keys=ON")
+    return g.db
+
+@app.teardown_appcontext
+def close_db(_):
+    db = g.pop("db", None)
+    if db: db.close()
+
+def q(sql, args=(), one=False):
+    rows = get_db().execute(sql, args).fetchall()
+    rows = [dict(r) for r in rows]
+    return (rows[0] if rows else None) if one else rows
+
+def run(sql, args=()):
+    db = get_db(); cur = db.execute(sql, args); db.commit(); return cur.lastrowid
+
+def init_db():
+    with sqlite3.connect(DB_FILE) as db:
+        db.executescript(SCHEMA)
+        if not db.execute("SELECT 1 FROM users WHERE role='ADMIN'").fetchone():
+            db.execute("INSERT INTO users(name,email,password,role) VALUES(?,?,?,?)",
+                       ("Administrator", "admin@college.edu", generate_password_hash("admin123"), "ADMIN"))
+
+# ---------- Auth (FR1) ----------
+def login_required(*roles):
+    def deco(fn):
+        @wraps(fn)
+        def wrapper(*a, **kw):
+            if "uid" not in session: return jsonify(error="Login required"), 401
+            if roles and session["role"] not in roles: return jsonify(error="Not authorised"), 403
+            return fn(*a, **kw)
+        return wrapper
+    return deco
+
+@app.get("/")
+def index(): return render_template("index.html")
+
+@app.post("/api/login")
+def login():
+    d = request.json or {}
+    u = q("SELECT * FROM users WHERE email=?", (d.get("email", ""),), one=True)
+    if not u or not check_password_hash(u["password"], d.get("password", "")):
+        return jsonify(error="Invalid credentials"), 401
+    session.update(uid=u["id"], role=u["role"], name=u["name"], attempts=0)
+    return jsonify(id=u["id"], name=u["name"], role=u["role"])
+
+@app.post("/api/logout")
+def logout(): session.clear(); return jsonify(ok=True)
+
+@app.get("/api/me")
+def me():
+    if "uid" not in session: return jsonify(error="no session"), 401
+    return jsonify(id=session["uid"], name=session["name"], role=session["role"], face_enabled=FACE_ENABLED)
+
+# ---------- Admin: students / faculty / subjects (FR2-FR4) ----------
+@app.get("/api/users")
+@login_required("ADMIN", "FACULTY")
+def list_users():
+    role = request.args.get("role")
+    sql = "SELECT id,name,email,role,roll_no,department,year,section FROM users"
+    return jsonify(q(sql + (" WHERE role=?" if role else ""), (role,) if role else ()))
+
+@app.post("/api/users")
+@login_required("ADMIN")
+def add_user():
+    d = request.json
+    try:
+        uid = run("INSERT INTO users(name,email,password,role,roll_no,department,year,section) VALUES(?,?,?,?,?,?,?,?)",
+                  (d["name"], d["email"], generate_password_hash(d["password"]), d["role"].upper(),
+                   d.get("roll_no"), d.get("department"), d.get("year") or None, d.get("section")))
+    except (sqlite3.IntegrityError, KeyError) as e:
+        return jsonify(error=f"Could not add user: {e}"), 400
+    return jsonify(id=uid), 201
+
+@app.put("/api/users/<int:uid>")
+@login_required("ADMIN")
+def update_user(uid):
+    d = request.json
+    run("UPDATE users SET name=?,department=?,year=?,section=?,roll_no=? WHERE id=?",
+        (d.get("name"), d.get("department"), d.get("year"), d.get("section"), d.get("roll_no"), uid))
+    return jsonify(ok=True)
+
+@app.delete("/api/users/<int:uid>")
+@login_required("ADMIN")
+def delete_user(uid):
+    for t in ("attendance", "face_encodings", "notifications"):
+        run(f"DELETE FROM {t} WHERE {'student_id' if t != 'notifications' else 'user_id'}=?", (uid,))
+    run("DELETE FROM users WHERE id=?", (uid,))
+    return jsonify(ok=True)
+
+@app.get("/api/subjects")
+@login_required()
+def list_subjects():
+    return jsonify(q("SELECT s.*, u.name AS faculty FROM subjects s LEFT JOIN users u ON u.id=s.faculty_id"))
+
+@app.post("/api/subjects")
+@login_required("ADMIN")
+def add_subject():
+    d = request.json
+    return jsonify(id=run("INSERT INTO subjects(name,faculty_id,department) VALUES(?,?,?)",
+                          (d["name"], d.get("faculty_id"), d.get("department")))), 201
+
+# ---------- Face helpers (FaceRecognition class) ----------
+def _decode(b64):
+    img = Image.open(io.BytesIO(base64.b64decode(b64.split(",")[-1]))).convert("RGB")
+    return np.array(img)
+
+def detect_encoding(b64):
+    """detectFace(): returns (encoding or None, reason)."""
+    faces = face_recognition.face_encodings(_decode(b64))
+    if not faces: return None, "No face detected"
+    if len(faces) > 1: return None, "Multiple faces detected"
+    return faces[0], ""
+
+def match_face(known, probe):
+    """matchFace() + getConfidence()."""
+    dist = float(face_recognition.face_distance([known], probe)[0])
+    return dist <= FACE_THRESHOLD, round(1 - dist, 3)
+
+@app.post("/api/users/<int:uid>/face")
+@login_required("ADMIN")
+def register_face(uid):
+    if not FACE_ENABLED: return jsonify(error="face_recognition not installed"), 501
+    enc, why = detect_encoding(request.json["image"])
+    if enc is None: return jsonify(error=why), 400
+    run("INSERT OR REPLACE INTO face_encodings(student_id,encoding) VALUES(?,?)", (uid, json.dumps(enc.tolist())))
+    return jsonify(ok=True)
+
+# ---------- Sessions (Faculty) ----------
+@app.post("/api/sessions")
+@login_required("FACULTY", "ADMIN")
+def start_session():
+    d, now = request.json, datetime.now()
+    sid = run("INSERT INTO sessions(subject_id,date,start_time,room) VALUES(?,?,?,?)",
+              (d["subject_id"], now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S"), d.get("room")))
+    return jsonify(id=sid), 201
+
+@app.post("/api/sessions/<int:sid>/end")
+@login_required("FACULTY", "ADMIN")
+def end_session(sid):
+    run("UPDATE sessions SET active=0,end_time=? WHERE id=?", (datetime.now().strftime("%H:%M:%S"), sid))
+    # Mark everyone in nobody-marked state as ABSENT? Kept explicit: absent = no PRESENT row (see stats).
+    return jsonify(ok=True)
+
+@app.get("/api/sessions/active")
+@login_required()
+def active_sessions():
+    return jsonify(q("""SELECT se.id, se.date, se.start_time, se.room, s.name AS subject
+                        FROM sessions se JOIN subjects s ON s.id=se.subject_id WHERE se.active=1"""))
+
+# ---------- Attendance (FR5, FR6, FR7) ----------
+def _mark(student_id, session_id, method, remarks=""):
+    now = datetime.now()
+    try:
+        run("INSERT INTO attendance(student_id,session_id,date,time,status,method,remarks) VALUES(?,?,?,?,?,?,?)",
+            (student_id, session_id, now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S"), "PRESENT", method, remarks))
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+@app.post("/api/attendance/face")
+@login_required("STUDENT")
+def mark_by_face():
+    if not FACE_ENABLED: return jsonify(error="Face recognition unavailable; ask faculty for manual entry"), 501
+    d = request.json
+    se = q("SELECT * FROM sessions WHERE id=? AND active=1", (d["session_id"],), one=True)
+    if not se: return jsonify(error="Session not active"), 400
+    if q("SELECT 1 FROM attendance WHERE student_id=? AND session_id=?", (session["uid"], se["id"]), one=True):
+        return jsonify(status="ALREADY", message="Already Present"), 200
+    row = q("SELECT encoding FROM face_encodings WHERE student_id=?", (session["uid"],), one=True)
+    if not row: return jsonify(error="No face registered. Contact admin."), 400
+    enc, why = detect_encoding(d["image"])
+    ok, conf = (False, 0)
+    if enc is not None: ok, conf = match_face(np.array(json.loads(row["encoding"])), enc)
+    if not ok:
+        session["attempts"] = session.get("attempts", 0) + 1
+        left = MAX_ATTEMPTS - session["attempts"]
+        return jsonify(status="FAILED", message=why or "Face not recognized", attempts_left=max(left, 0),
+                       manual_required=left <= 0), 200
+    session["attempts"] = 0
+    _mark(session["uid"], se["id"], "FACE", f"confidence={conf}")
+    return jsonify(status="MARKED", message="Attendance Marked", confidence=conf)
+
+@app.post("/api/attendance/manual")        # fallback when recognition fails
+@login_required("FACULTY", "ADMIN")
+def mark_manual():
+    d = request.json
+    stu = q("SELECT id FROM users WHERE role='STUDENT' AND (roll_no=? OR id=?)", (d.get("roll_no"), d.get("student_id")), one=True)
+    if not stu: return jsonify(error="Student not found"), 404
+    if not _mark(stu["id"], d["session_id"], "MANUAL", d.get("remarks", "manual entry")):
+        return jsonify(message="Already Present")
+    return jsonify(message="Attendance Marked")
+
+@app.put("/api/attendance/<int:aid>")      # edit if authorised
+@login_required("FACULTY", "ADMIN")
+def edit_attendance(aid):
+    run("UPDATE attendance SET status=?, remarks=? WHERE id=?", (request.json["status"], request.json.get("remarks"), aid))
+    return jsonify(ok=True)
+
+# ---------- Calculation, dashboard, reports (FR8-FR11) ----------
+def student_stats(student_id):
+    """Subject-wise attendance %  = present / total sessions * 100."""
+    return q("""
+      SELECT s.id AS subject_id, s.name AS subject,
+             COUNT(DISTINCT se.id) AS total,
+             COUNT(DISTINCT CASE WHEN a.status='PRESENT' THEN a.id END) AS present
+      FROM subjects s JOIN sessions se ON se.subject_id=s.id AND se.active=0
+      LEFT JOIN attendance a ON a.session_id=se.id AND a.student_id=?
+      GROUP BY s.id""", (student_id,))
+
+def with_percent(rows):
+    for r in rows:
+        r["percent"] = round(r["present"] / r["total"] * 100, 2) if r["total"] else 0.0
+        r["low"] = r["total"] > 0 and r["percent"] < MIN_PERCENT       # FR10
+    return rows
+
+@app.get("/api/my-attendance")
+@login_required("STUDENT")
+def my_attendance():
+    stats = with_percent(student_stats(session["uid"]))
+    history = q("""SELECT a.date,a.time,a.status,a.method,s.name AS subject FROM attendance a
+                   JOIN sessions se ON se.id=a.session_id JOIN subjects s ON s.id=se.subject_id
+                   WHERE a.student_id=? ORDER BY a.date DESC, a.time DESC""", (session["uid"],))
+    tot, pres = sum(r["total"] for r in stats), sum(r["present"] for r in stats)
+    return jsonify(overall=round(pres / tot * 100, 2) if tot else 0, subjects=stats, history=history,
+                   alert=any(r["low"] for r in stats))
+
+def build_report():
+    kind, sid = request.args.get("type", "daily"), request.args.get("subject_id")
+    day, month, stu = request.args.get("date", date.today().isoformat()), request.args.get("month"), request.args.get("student_id")
+    sql = """SELECT u.roll_no, u.name AS student, s.name AS subject, a.date, a.time, a.status, a.method
+             FROM attendance a JOIN users u ON u.id=a.student_id JOIN sessions se ON se.id=a.session_id
+             JOIN subjects s ON s.id=se.subject_id WHERE 1=1"""
+    args = []
+    if kind == "daily":   sql += " AND a.date=?"; args.append(day)
+    if kind == "monthly": sql += " AND substr(a.date,1,7)=?"; args.append(month or day[:7])
+    if sid:  sql += " AND s.id=?"; args.append(sid)
+    if stu:  sql += " AND u.id=?"; args.append(stu)
+    return q(sql + " ORDER BY a.date, u.roll_no", args)
+
+@app.get("/api/report")
+@login_required("FACULTY", "ADMIN")
+def report(): return jsonify(build_report())
+
+@app.get("/api/report/export")             # AttendanceReport.exportExcel(): CSV opens in Excel
+@login_required("FACULTY", "ADMIN")
+def export_report():
+    rows, buf = build_report(), io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=["roll_no", "student", "subject", "date", "time", "status", "method"])
+    w.writeheader(); w.writerows(rows)
+    return Response(buf.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=attendance_report.csv"})
+
+@app.get("/api/low-attendance")
+@login_required("FACULTY", "ADMIN")
+def low_attendance():
+    out = []
+    for stu in q("SELECT id,name,roll_no FROM users WHERE role='STUDENT'"):
+        for r in with_percent(student_stats(stu["id"])):
+            if r["low"]:
+                out.append(dict(student=stu["name"], roll_no=stu["roll_no"], subject=r["subject"], percent=r["percent"]))
+    return jsonify(out)
+
+if __name__ == "__main__":
+    init_db()
+    app.run(debug=True)
