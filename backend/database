@@ -1,0 +1,91 @@
+// Database setup (SQLite), schema, demo seed data and shared helpers
+const Database = require('better-sqlite3');
+const bcrypt = require('bcryptjs');
+const path = require('path');
+
+const db = new Database(process.env.DB_FILE || path.join(__dirname, 'attendance.db'));
+db.pragma('journal_mode = WAL');
+db.pragma('foreign_keys = ON');
+
+const LOW = Number(process.env.LOW_ATTENDANCE || 75);
+const localDate = (d = new Date()) => d.toLocaleDateString('en-CA'); // YYYY-MM-DD
+const today = () => localDate();
+const nowTime = () => new Date().toTimeString().slice(0, 5);
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS admins(
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE, password TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS faculty(
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, department TEXT, email TEXT NOT NULL UNIQUE, password TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS students(
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, department TEXT, year INTEGER, section TEXT,
+  email TEXT NOT NULL UNIQUE, password TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS subjects(
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, faculty_id TEXT REFERENCES faculty(id));
+CREATE TABLE IF NOT EXISTS sessions(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, subject_id TEXT NOT NULL REFERENCES subjects(id),
+  room TEXT, date TEXT NOT NULL, started_at TEXT, ended_at TEXT, active INTEGER NOT NULL DEFAULT 1);
+CREATE TABLE IF NOT EXISTS attendance(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  student_id TEXT NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+  subject_id TEXT NOT NULL REFERENCES subjects(id),
+  session_id INTEGER NOT NULL REFERENCES sessions(id),
+  date TEXT NOT NULL, time TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('Present','Absent')),
+  method TEXT, remarks TEXT,
+  UNIQUE(student_id, session_id));
+CREATE INDEX IF NOT EXISTS idx_att_student ON attendance(student_id, subject_id);
+`);
+
+// Attendance summary for one student (overall + subject-wise + low-attendance alerts)
+function summaryFor(sid) {
+  const subjects = db.prepare(`
+    SELECT s.id, s.name, SUM(a.status='Present') AS present, COUNT(a.id) AS total
+    FROM subjects s LEFT JOIN attendance a ON a.subject_id = s.id AND a.student_id = ?
+    GROUP BY s.id ORDER BY s.id`).all(sid).map(r => {
+      const present = r.present || 0;
+      return { id: r.id, name: r.name, present, total: r.total, percent: r.total ? Math.round(present / r.total * 100) : 0 };
+    });
+  const present = subjects.reduce((a, x) => a + x.present, 0);
+  const total = subjects.reduce((a, x) => a + x.total, 0);
+  return {
+    overall: { present, total, percent: total ? Math.round(present / total * 100) : 0 },
+    subjects,
+    low: subjects.filter(x => x.total && x.percent < LOW),
+    threshold: LOW
+  };
+}
+
+// ---- Demo data (runs only on an empty database) ----
+function seed() {
+  if (db.prepare('SELECT COUNT(*) c FROM admins').get().c) return;
+  const hash = p => bcrypt.hashSync(p, 8);
+  db.transaction(() => {
+    db.prepare('INSERT INTO admins VALUES(?,?,?,?)').run('A1', 'Admin', 'admin@college.edu', hash('admin'));
+    const f = db.prepare('INSERT INTO faculty VALUES(?,?,?,?,?)');
+    f.run('F1', 'Dr. Meera Iyer', 'CSE', 'f1@college.edu', hash('1234'));
+    f.run('F2', 'Prof. Arjun Rao', 'CSE', 'f2@college.edu', hash('1234'));
+    const sb = db.prepare('INSERT INTO subjects VALUES(?,?,?)');
+    [['SUB1', 'Data Structures', 'F1'], ['SUB2', 'Database Systems', 'F1'],
+     ['SUB3', 'Operating Systems', 'F2'], ['SUB4', 'Software Engineering', 'F2']].forEach(x => sb.run(...x));
+    const names = ['Aarav Shah', 'Diya Menon', 'Kabir Singh', 'Isha Verma', 'Rohan Das', 'Sana Khan', 'Vikram Nair', 'Priya Pillai'];
+    const rates = [.95, .9, .82, .68, .6, .88, .78, .92];
+    const st = db.prepare('INSERT INTO students VALUES(?,?,?,?,?,?,?)');
+    const pw = hash('1234');
+    names.forEach((n, i) => st.run('S' + (101 + i), n, 'CSE', 2, 'A', 's' + (101 + i) + '@college.edu', pw));
+    const ins = db.prepare("INSERT INTO sessions(subject_id,room,date,started_at,ended_at,active) VALUES(?,?,?,?,?,0)");
+    const att = db.prepare('INSERT INTO attendance(student_id,subject_id,session_id,date,time,status,method) VALUES(?,?,?,?,?,?,?)');
+    for (let d = 1; d <= 20; d++) {
+      const date = localDate(new Date(Date.now() - d * 864e5));
+      ['SUB1', 'SUB2', 'SUB3', 'SUB4'].forEach((sub, k) => {
+        const sid = ins.run(sub, 'R' + (101 + k), date, '09:00', '10:00').lastInsertRowid;
+        names.forEach((_, i) => att.run('S' + (101 + i), sub, sid, date, '09:05',
+          Math.random() < rates[i] ? 'Present' : 'Absent', 'seed'));
+      });
+    }
+  })();
+  console.log('Demo data created.');
+}
+seed();
+
+module.exports = { db, LOW, today, nowTime, summaryFor };
