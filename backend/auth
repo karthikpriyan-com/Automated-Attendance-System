@@ -1,0 +1,24 @@
+const router = require('express').Router();
+const bcrypt = require('bcryptjs');
+const { db } = require('../db');
+const { sign, auth } = require('../middleware');
+
+// POST /api/auth/login  { email, password }
+router.post('/login', (req, res) => {
+  const { email, password } = req.body || {};
+  if (!email || !password) return res.status(400).json({ error: 'Enter your email and password' });
+  const e = String(email).trim().toLowerCase();
+  for (const [role, table] of [['admin', 'admins'], ['faculty', 'faculty'], ['student', 'students']]) {
+    const u = db.prepare(`SELECT * FROM ${table} WHERE email = ?`).get(e);
+    if (u && bcrypt.compareSync(String(password), u.password)) {
+      const user = { id: u.id, name: u.name, role };
+      return res.json({ token: sign(user), user });
+    }
+  }
+  res.status(401).json({ error: 'Email or password is incorrect' });
+});
+
+// GET /api/auth/me
+router.get('/me', auth, (req, res) => res.json(req.user));
+
+module.exports = router;
