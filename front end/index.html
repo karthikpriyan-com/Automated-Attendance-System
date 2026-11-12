@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Automated Attendance System</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="root"></div>
+
+<dialog id="scanDlg">
+  <h3 id="scanTitle" style="margin-bottom:.8rem">Verify your face</h3>
+  <div class="cam"><video id="vid" autoplay playsinline muted></video><div class="frame"><i></i><i></i><i></i><i></i><b></b></div></div>
+  <p id="scanMsg" class="muted" role="status" style="margin:.8rem 0">Position your face inside the frame.</p>
+  <div id="manual" hidden>
+    <label for="manId">Enter your student ID to continue</label>
+    <input id="manId" placeholder="e.g. S101">
+  </div>
+  <div class="row sp" style="margin-top:1rem">
+    <button class="btn ghost" onclick="closeScan()">Cancel</button>
+    <button class="btn" id="scanBtn" onclick="doScan()">Scan face</button>
+  </div>
+</dialog>
+<div id="toast" role="status"></div>
+
+<script src="script.js"></script>
+</body>
+</html>
