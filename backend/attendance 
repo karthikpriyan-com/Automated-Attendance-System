@@ -1,0 +1,122 @@
+// Class sessions + attendance marking, editing and student views
+const router = require('express').Router();
+const { db, today, nowTime, summaryFor } = require('../db');
+const { auth, role } = require('../middleware');
+const { verifyFace } = require('../faceService');
+
+const MAX_TRIES = 3;
+const attempts = new Map(); // "studentId:sessionId" -> failed face scans
+
+const owns = (user, subjectId) =>
+  user.role === 'admin' ||
+  !!db.prepare('SELECT 1 FROM subjects WHERE id=? AND faculty_id=?').get(subjectId, user.id);
+
+const upsert = db.prepare(`
+  INSERT INTO attendance(student_id,subject_id,session_id,date,time,status,method,remarks)
+  VALUES(@student_id,@subject_id,@session_id,@date,@time,@status,@method,@remarks)
+  ON CONFLICT(student_id,session_id) DO UPDATE SET
+    status=excluded.status, time=excluded.time, method=excluded.method, remarks=excluded.remarks`);
+
+// ---------- Sessions ----------
+// Open sessions (students see these on their dashboard)
+router.get('/sessions/active', auth, (req, res) => {
+  const rows = db.prepare(`SELECT se.id, se.subject_id AS subjectId, sub.name AS subjectName, se.room, se.date, se.started_at AS startedAt
+    FROM sessions se JOIN subjects sub ON sub.id = se.subject_id WHERE se.active = 1`).all();
+  if (req.user.role === 'student') {
+    const done = db.prepare("SELECT session_id FROM attendance WHERE student_id=? AND status='Present'").all(req.user.id).map(x => x.session_id);
+    return res.json(rows.map(r => ({ ...r, alreadyMarked: done.includes(r.id) })));
+  }
+  res.json(rows);
+});
+
+// Faculty starts a class session
+router.post('/sessions', auth, role('faculty'), (req, res) => {
+  const { subjectId, room } = req.body || {};
+  if (!owns(req.user, subjectId)) return res.status(403).json({ error: 'You can only start sessions for your own subjects' });
+  if (db.prepare('SELECT 1 FROM sessions WHERE subject_id=? AND active=1').get(subjectId))
+    return res.status(409).json({ error: 'A session is already open for this subject' });
+  const r = db.prepare('INSERT INTO sessions(subject_id,room,date,started_at,active) VALUES(?,?,?,?,1)')
+    .run(subjectId, room || '', today(), nowTime());
+  res.status(201).json({ id: r.lastInsertRowid, subjectId, room });
+});
+
+// Live roster for a session
+router.get('/sessions/:id/roster', auth, role('faculty', 'admin'), (req, res) => {
+  const se = db.prepare('SELECT * FROM sessions WHERE id=?').get(req.params.id);
+  if (!se) return res.status(404).json({ error: 'Session not found' });
+  if (!owns(req.user, se.subject_id)) return res.status(403).json({ error: 'Not your subject' });
+  res.json(db.prepare(`SELECT st.id, st.name, a.status, a.time, a.method, a.remarks
+    FROM students st LEFT JOIN attendance a ON a.student_id = st.id AND a.session_id = ? ORDER BY st.id`).all(se.id));
+});
+
+// End session: anyone not marked becomes Absent
+router.post('/sessions/:id/end', auth, role('faculty'), (req, res) => {
+  const se = db.prepare('SELECT * FROM sessions WHERE id=? AND active=1').get(req.params.id);
+  if (!se) return res.status(404).json({ error: 'No open session with this id' });
+  if (!owns(req.user, se.subject_id)) return res.status(403).json({ error: 'Not your subject' });
+  let absent = 0;
+  db.transaction(() => {
+    const missing = db.prepare('SELECT id FROM students WHERE id NOT IN (SELECT student_id FROM attendance WHERE session_id=?)').all(se.id);
+    missing.forEach(s => { upsert.run({ student_id: s.id, subject_id: se.subject_id, session_id: se.id, date: se.date, time: nowTime(), status: 'Absent', method: 'auto', remarks: 'Not scanned' }); absent++; });
+    db.prepare('UPDATE sessions SET active=0, ended_at=? WHERE id=?').run(nowTime(), se.id);
+  })();
+  res.json({ message: 'Session ended', markedAbsent: absent });
+});
+
+// ---------- Marking ----------
+// Student marks own attendance. method: "face" (default) or "manual" (only after 3 failed scans)
+router.post('/attendance/mark', auth, role('student'), async (req, res, next) => {
+  try {
+    const { sessionId, method, studentId, image } = req.body || {};
+    const se = db.prepare('SELECT * FROM sessions WHERE id=? AND active=1').get(sessionId);
+    if (!se) return res.status(400).json({ error: 'This class session is not open' });
+
+    const sid = req.user.id, key = sid + ':' + se.id;
+    const ex = db.prepare('SELECT status FROM attendance WHERE student_id=? AND session_id=?').get(sid, se.id);
+    if (ex && ex.status === 'Present') return res.status(409).json({ error: 'Already marked present for this class' });
+
+    let remarks, how;
+    if (method === 'manual') {
+      if ((attempts.get(key) || 0) < MAX_TRIES)
+        return res.status(403).json({ error: 'Manual entry opens after 3 failed face scans' });
+      if (String(studentId || '').toUpperCase() !== sid)
+        return res.status(422).json({ error: 'That ID does not match your account' });
+      remarks = 'Manual entry'; how = 'manual';
+    } else {
+      const f = await verifyFace(sid, image);
+      if (!f.matched) {
+        const n = (attempts.get(key) || 0) + 1;
+        attempts.set(key, n);
+        return res.status(422).json({ error: 'Face not recognized', attempt: n, maxAttempts: MAX_TRIES, manualEntryOpen: n >= MAX_TRIES });
+      }
+      attempts.delete(key);
+      remarks = `Face recognition (${Math.round(f.confidence * 100)}%)`; how = 'face';
+    }
+    upsert.run({ student_id: sid, subject_id: se.subject_id, session_id: se.id, date: se.date, time: nowTime(), status: 'Present', method: how, remarks });
+    res.json({ message: 'Attendance marked', subjectId: se.subject_id, time: nowTime() });
+  } catch (e) { next(e); }
+});
+
+// Faculty/admin edits one student's status in a session
+router.put('/attendance', auth, role('faculty', 'admin'), (req, res) => {
+  const { sessionId, studentId, status } = req.body || {};
+  if (!['Present', 'Absent'].includes(status)) return res.status(400).json({ error: 'Status must be Present or Absent' });
+  const se = db.prepare('SELECT * FROM sessions WHERE id=?').get(sessionId);
+  if (!se) return res.status(404).json({ error: 'Session not found' });
+  if (!owns(req.user, se.subject_id)) return res.status(403).json({ error: 'You can only edit your own subjects' });
+  if (!db.prepare('SELECT 1 FROM students WHERE id=?').get(studentId)) return res.status(404).json({ error: 'Student not found' });
+  upsert.run({ student_id: studentId, subject_id: se.subject_id, session_id: se.id, date: se.date, time: nowTime(), status, method: 'edit', remarks: 'Edited by ' + req.user.role });
+  res.json({ message: 'Attendance updated' });
+});
+
+// ---------- Student views ----------
+router.get('/attendance/me/summary', auth, role('student'), (req, res) => res.json(summaryFor(req.user.id)));
+
+router.get('/attendance/me/history', auth, role('student'), (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 40, 200);
+  res.json(db.prepare(`SELECT a.date, a.time, a.status, sub.name AS subject
+    FROM attendance a JOIN subjects sub ON sub.id = a.subject_id
+    WHERE a.student_id = ? ORDER BY a.date DESC, a.time DESC LIMIT ?`).all(req.user.id, limit));
+});
+
+module.exports = router;
