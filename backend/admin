@@ -1,0 +1,93 @@
+// Student, faculty and subject management
+const router = require('express').Router();
+const bcrypt = require('bcryptjs');
+const { db, summaryFor } = require('../db');
+const { auth, role } = require('../middleware');
+
+const nextId = (table, prefix) => {
+  const r = db.prepare(`SELECT id FROM ${table} ORDER BY CAST(SUBSTR(id, ${prefix.length + 1}) AS INTEGER) DESC LIMIT 1`).get();
+  return prefix + (r ? Number(r.id.slice(prefix.length)) + 1 : 1);
+};
+const dup = (res, err, msg) => {
+  if (String(err.message).includes('UNIQUE')) return res.status(409).json({ error: msg });
+  throw err;
+};
+
+// ---------- Students ----------
+router.get('/students', auth, role('admin', 'faculty'), (req, res) => {
+  const rows = db.prepare('SELECT id,name,department,year,section,email FROM students ORDER BY id').all()
+    .map(s => ({ ...s, attendancePercent: summaryFor(s.id).overall.percent }));
+  res.json(rows);
+});
+
+router.post('/students', auth, role('admin'), (req, res) => {
+  const { name, department, year, section, email, password } = req.body || {};
+  if (!name || !email || !password) return res.status(400).json({ error: 'Name, email and password are required' });
+  const id = db.prepare('SELECT COUNT(*) c FROM students').get().c ? nextId('students', 'S') : 'S101';
+  try {
+    db.prepare('INSERT INTO students VALUES(?,?,?,?,?,?,?)')
+      .run(id, name.trim(), department || '', Number(year) || 1, section || '', email.trim().toLowerCase(), bcrypt.hashSync(String(password), 8));
+  } catch (e) { return dup(res, e, 'A student with this email already exists'); }
+  res.status(201).json({ id, name, email });
+});
+
+router.put('/students/:id', auth, role('admin'), (req, res) => {
+  const s = db.prepare('SELECT * FROM students WHERE id=?').get(req.params.id);
+  if (!s) return res.status(404).json({ error: 'Student not found' });
+  const b = req.body || {};
+  try {
+    db.prepare('UPDATE students SET name=?,department=?,year=?,section=?,email=?,password=? WHERE id=?').run(
+      b.name ?? s.name, b.department ?? s.department, b.year ?? s.year, b.section ?? s.section,
+      (b.email ?? s.email).toLowerCase(), b.password ? bcrypt.hashSync(String(b.password), 8) : s.password, s.id);
+  } catch (e) { return dup(res, e, 'Another student already uses this email'); }
+  res.json({ message: 'Student updated' });
+});
+
+router.delete('/students/:id', auth, role('admin'), (req, res) => {
+  const r = db.prepare('DELETE FROM students WHERE id=?').run(req.params.id); // attendance cascades
+  if (!r.changes) return res.status(404).json({ error: 'Student not found' });
+  res.json({ message: 'Student and their attendance records deleted' });
+});
+
+// ---------- Faculty ----------
+router.get('/faculty', auth, role('admin'), (req, res) =>
+  res.json(db.prepare('SELECT id,name,department,email FROM faculty ORDER BY id').all()));
+
+router.post('/faculty', auth, role('admin'), (req, res) => {
+  const { name, department, email, password } = req.body || {};
+  if (!name || !email) return res.status(400).json({ error: 'Name and email are required' });
+  const id = nextId('faculty', 'F');
+  try {
+    db.prepare('INSERT INTO faculty VALUES(?,?,?,?,?)')
+      .run(id, name.trim(), department || '', email.trim().toLowerCase(), bcrypt.hashSync(String(password || '1234'), 8));
+  } catch (e) { return dup(res, e, 'A faculty member with this email already exists'); }
+  res.status(201).json({ id, name, email });
+});
+
+// ---------- Subjects ----------
+router.get('/subjects', auth, (req, res) => {
+  let rows = db.prepare(`SELECT s.id, s.name, s.faculty_id AS facultyId, f.name AS facultyName
+    FROM subjects s LEFT JOIN faculty f ON f.id = s.faculty_id ORDER BY s.id`).all();
+  if (req.user.role === 'faculty') rows = rows.filter(r => r.facultyId === req.user.id);
+  res.json(rows);
+});
+
+router.post('/subjects', auth, role('admin'), (req, res) => {
+  const { name, facultyId } = req.body || {};
+  if (!name) return res.status(400).json({ error: 'Subject name is required' });
+  if (facultyId && !db.prepare('SELECT 1 FROM faculty WHERE id=?').get(facultyId))
+    return res.status(400).json({ error: 'Choose an existing faculty member' });
+  const id = nextId('subjects', 'SUB');
+  db.prepare('INSERT INTO subjects VALUES(?,?,?)').run(id, name.trim(), facultyId || null);
+  res.status(201).json({ id, name, facultyId });
+});
+
+router.put('/subjects/:id', auth, role('admin'), (req, res) => {
+  const { name, facultyId } = req.body || {};
+  const s = db.prepare('SELECT * FROM subjects WHERE id=?').get(req.params.id);
+  if (!s) return res.status(404).json({ error: 'Subject not found' });
+  db.prepare('UPDATE subjects SET name=?, faculty_id=? WHERE id=?').run(name ?? s.name, facultyId ?? s.faculty_id, s.id);
+  res.json({ message: 'Subject updated' });
+});
+
+module.exports = router;
