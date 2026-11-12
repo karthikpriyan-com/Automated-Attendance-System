@@ -1,0 +1,13 @@
+// Face recognition placeholder.
+// Replace verifyFace() with a call to your real recognition service
+// (Python + OpenCV/face_recognition, AWS Rekognition, Azure Face, etc.).
+// It must return { matched: boolean, confidence: number between 0 and 1 }.
+const THRESHOLD = Number(process.env.FACE_THRESHOLD || 0.75);
+
+async function verifyFace(studentId, imageBase64) {
+  // DEMO ONLY: random confidence so you can test the full flow.
+  const confidence = 0.6 + Math.random() * 0.4;
+  return { matched: confidence >= THRESHOLD, confidence };
+}
+
+module.exports = { verifyFace, THRESHOLD };
