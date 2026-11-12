@@ -1,0 +1,36 @@
+# Attendance System - Backend (Node.js + Express + SQLite)
+
+## Run
+    npm install
+    npm start          # http://localhost:3000
+
+Optional environment variables: `PORT`, `JWT_SECRET` (set this!), `LOW_ATTENDANCE` (default 75), `FACE_THRESHOLD`, `DB_FILE`.
+
+Demo accounts (created on first run): admin@college.edu / admin, f1@college.edu / 1234, s101@college.edu / 1234
+
+Send the token on every request: `Authorization: Bearer <token>`
+
+## API
+| Method | Route | Who | Purpose |
+|---|---|---|---|
+| POST | /api/auth/login | all | Log in, returns token |
+| GET | /api/auth/me | all | Current user |
+| GET/POST | /api/students | admin (GET: +faculty) | List / add students |
+| PUT/DELETE | /api/students/:id | admin | Update / delete |
+| GET/POST | /api/faculty | admin | List / add faculty |
+| GET/POST/PUT | /api/subjects | admin (GET: all) | Manage subjects, assign faculty |
+| GET | /api/sessions/active | all | Open class sessions |
+| POST | /api/sessions | faculty | Start session `{subjectId, room}` |
+| GET | /api/sessions/:id/roster | faculty, admin | Live roster |
+| POST | /api/sessions/:id/end | faculty | End session, mark rest absent |
+| POST | /api/attendance/mark | student | `{sessionId, method:"face", image}` or `{sessionId, method:"manual", studentId}` |
+| PUT | /api/attendance | faculty, admin | Edit `{sessionId, studentId, status}` |
+| GET | /api/attendance/me/summary | student | Overall %, subject-wise, low alerts |
+| GET | /api/attendance/me/history | student | Attendance history |
+| GET | /api/reports | faculty, admin | `?type=student\|subject\|daily\|monthly&subject=&value=&format=csv` |
+| GET | /api/reports/low | faculty, admin | Students below the required % |
+
+## Notes
+- `faceService.js` is a demo stub. Replace `verifyFace()` with your real recognition service.
+- Manual entry opens only after 3 failed face scans, matching your state chart.
+- Duplicate attendance is blocked in code and by a database UNIQUE(student_id, session_id) rule.
